@@ -210,16 +210,36 @@ def load_state(args=None):
     path = state_path(args)
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # Corrupt/truncated state.json (e.g. a concurrent non-atomic write was
+        # observed mid-flight). Back up the bad file and start fresh rather than
+        # raising — load_state is called inside the keepalive forever-loop where
+        # a raised JSONDecodeError would make every subsequent round crash.
+        corrupt = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        try:
+            shutil.copy2(str(path), str(corrupt))
+        except OSError:
+            pass
+        sys.stderr.write(
+            f"[warn] state.json corrupt, backed up to {corrupt.name}; resetting to empty\n"
+        )
+        return {}
 
 
 def save_state(state, args=None):
     path = state_path(args)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    # Atomic write: write a pid-scoped temp then os.replace (atomic on POSIX and
+    # Windows). The pid suffix avoids tmp-name collisions when several child
+    # processes (multi-card same-account) call merge_state concurrently.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    os.replace(str(tmp), str(path))
     try:
         path.chmod(0o600)
     except OSError:

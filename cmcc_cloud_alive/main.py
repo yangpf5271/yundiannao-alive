@@ -2930,7 +2930,15 @@ def _simple_refresh_token_if_needed(state_path, context="账号token检测"):
 
 
 def _is_auth_expired_error(err):
-    """True when control-plane returned INVALID_TOKEN_CODES (e.g. 4015)."""
+    """True when control-plane returned INVALID_TOKEN_CODES (e.g. 4015).
+
+    Only the structured ``CmccError.response`` dict and the explicit
+    ``code=4015`` / ``用户未登录`` message tokens are trusted. We deliberately do
+    NOT substring-match every INVALID_TOKEN_CODES against the raw error text:
+    gateway error bodies (or a longer code like ``code=40150``) would otherwise
+    false-positive and trigger an unnecessary force re-login that invalidates
+    sibling cards' tokens (4015 thrash).
+    """
     resp = getattr(err, "response", None)
     if isinstance(resp, dict):
         try:
@@ -2942,9 +2950,6 @@ def _is_auth_expired_error(err):
     text = str(err or "")
     if "code=4015" in text or "用户未登录" in text:
         return True
-    for c in token.INVALID_TOKEN_CODES:
-        if f"code={c}" in text:
-            return True
     return False
 
 
