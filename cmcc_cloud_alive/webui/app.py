@@ -5,6 +5,7 @@ on the ASGI event-loop thread. Handlers live in split modules (D1 R4).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -108,7 +109,18 @@ routes = [
 if _STATIC_DIR.is_dir():
     routes.append(Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"))
 
-app = Starlette(debug=os.environ.get("CMCC_WEBUI_DEBUG") == "1", routes=routes)
+# Bind the running event loop to ORCH at startup so worker threads (_watch /
+# FakeBackend._run) can safely enqueue SSE events via loop.call_soon_threadsafe.
+# Without this, _emit's cross-thread put_nowait on asyncio.Queue is unsafe.
+def _on_startup() -> None:
+    ORCH.bind_loop(asyncio.get_running_loop())
+
+
+app = Starlette(
+    debug=os.environ.get("CMCC_WEBUI_DEBUG") == "1",
+    routes=routes,
+    on_startup=[_on_startup],
+)
 app.add_middleware(OptionalTokenMiddleware)
 
 

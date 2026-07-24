@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -96,13 +97,29 @@ def _spawn_cwd() -> str:
     return str(cand)
 
 
+# Match a secret-ish key followed by a separator and its value, masking only
+# the value. Supports both plain (``token=abc`` / ``Authorization: Bearer x``)
+# and JSON-ish (``"sohoToken":"eyJ..."``) forms by tolerating optional quotes
+# around the key and value. Normal prose that merely mentions a secret word
+# (e.g. "获取 token 列表", "cookiePolicy") is NOT matched because it lacks the
+# key<sep>value structure.
+_REDACT_RE = re.compile(
+    r"(?i)(password|passwd|token|secret|authorization|cookie)"
+    r"[\"']?\s*[:=]\s*[\"']?\S+"
+)
+
+
 def _redact_line(line: str) -> str:
-    """Strip obvious secret-ish tokens from log lines (never echo passwords)."""
-    low = line.lower()
-    for key in ("password", "passwd", "token", "secret", "authorization", "cookie"):
-        if key in low:
-            return f"[redacted:{key}]"
-    return line[:2000]
+    """Redact secret values in log lines without nuking the whole line."""
+    return _REDACT_RE.sub(lambda m: re.sub(r"\S+$", "[redacted]", m.group(0)), line)[:2000]
+
+
+def _emit_nowait(q: "asyncio.Queue", payload: Dict[str, Any]) -> None:
+    """Module-level put_nowait helper (callable from loop.call_soon_threadsafe)."""
+    try:
+        q.put_nowait(payload)
+    except asyncio.QueueFull:
+        pass
 
 
 def _fake_short_time() -> str:
@@ -377,23 +394,39 @@ class SubprocessBackend:
         self.stop_evt.set()
         proc = self._proc
         if proc and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+            # Windows has no os.killpg / signal.SIGKILL / process groups (and
+            # start_new_session=True is a no-op there). Use Popen's built-in
+            # terminate()/kill() which work cross-platform. Unix keeps killpg so
+            # the whole child session (subprocess threads) is signalled.
+            if sys.platform == "win32":
                 try:
                     proc.terminate()
-                except Exception:
+                except (ProcessLookupError, OSError):
                     pass
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, AttributeError, OSError):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
+                if sys.platform == "win32":
                     try:
                         proc.kill()
-                    except Exception:
+                    except (ProcessLookupError, OSError):
                         pass
+                else:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, AttributeError, OSError):
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=timeout)
@@ -641,14 +674,25 @@ class Orchestrator:
                 pass
 
     def _emit(self, event: str, data: Dict[str, Any]) -> None:
+        # _emit runs on worker threads (_watch / FakeBackend._run), but SSE
+        # consumers read the asyncio.Queue on the event-loop thread. Direct
+        # put_nowait across threads is unsafe (asyncio.Queue is not thread-safe).
+        # When the loop is bound, schedule the put on the loop thread; otherwise
+        # fall back to a direct put_nowait (keeps unit/in-process callers working
+        # before bind_loop is wired by app startup).
         payload = {"event": event, "data": data}
+        loop = self._loop
         with self._lock:
             subs = list(self._subscribers)
         for q in subs:
-            try:
-                q.put_nowait(payload)
-            except asyncio.QueueFull:
-                pass
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(_emit_nowait, q, payload)
+                    continue
+                except RuntimeError:
+                    # loop closed mid-flight — fall through to direct put
+                    pass
+            _emit_nowait(q, payload)
 
     # ------------------------------------------------------------------
     # Query

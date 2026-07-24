@@ -227,7 +227,9 @@ def _read_state(path: Path) -> Dict[str, Any]:
 
 def _write_state(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # pid + uuid scoped tmp avoids collisions when several handlers write the
+    # same profile concurrently (login + select-desktop + start_job can race).
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     try:
@@ -1225,7 +1227,9 @@ async def profiles_desktop_logout(request: Request) -> JSONResponse:
     # Read-only live path: do NOT _sync_shared_account here.
     # Sync would write this card's userServiceId into the shared acct_*.json and
     # clobber a sibling card of the same account (multi-card same-username).
-    live_path = _resolve_live_state_path(path, state)
+    # Resolve the shared acct path WITHOUT triggering sync (HARD_GATE#868).
+    username = str(state.get("username") or state.get("phone") or "").strip()
+    live_path = _shared_account_path(username) if username else path
 
     try:
         response = await asyncio.to_thread(_desktop_logout_for_profile, live_path, usid)
