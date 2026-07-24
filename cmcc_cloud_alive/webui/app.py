@@ -6,6 +6,7 @@ on the ASGI event-loop thread. Handlers live in split modules (D1 R4).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 
@@ -112,14 +113,19 @@ if _STATIC_DIR.is_dir():
 # Bind the running event loop to ORCH at startup so worker threads (_watch /
 # FakeBackend._run) can safely enqueue SSE events via loop.call_soon_threadsafe.
 # Without this, _emit's cross-thread put_nowait on asyncio.Queue is unsafe.
-def _on_startup() -> None:
+# NOTE: use a lifespan async context manager, NOT on_startup=[...]. The
+# Starlette wheel pinned in docker/wheels (1.3.1) removed the on_startup /
+# on_shutdown __init__ kwargs; lifespan works on both old and new Starlette.
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
     ORCH.bind_loop(asyncio.get_running_loop())
+    yield
 
 
 app = Starlette(
     debug=os.environ.get("CMCC_WEBUI_DEBUG") == "1",
     routes=routes,
-    on_startup=[_on_startup],
+    lifespan=_lifespan,
 )
 app.add_middleware(OptionalTokenMiddleware)
 
