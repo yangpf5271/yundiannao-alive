@@ -972,6 +972,34 @@ class NativeUdpTransport:
         return received
 
 
+def _native_callback_safe(method):
+    """Wrap a ctypes C-callback method so an exception never escapes into native.
+
+    These methods are invoked from the native ZIME engine via ctypes CFUNCTYPE.
+    A Python exception propagating back across the C boundary is undefined
+    behaviour (commonly a hard crash / corrupted native state). Any error is
+    recorded on the callback instance and the method returns 0 (the int return
+    expected by the transport/channel callbacks' success contract).
+    """
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as e:  # noqa: BLE001 — must never reach native
+            try:
+                self.records.append({
+                    "event": "native_callback_error",
+                    "callback": getattr(method, "__name__", method.__name__),
+                    "error": f"{e.__class__.__name__}: {e}",
+                    "traceOnly": True,
+                })
+            except Exception:
+                pass
+            return 0
+    wrapper.__name__ = getattr(method, "__name__", "native_callback")
+    wrapper.__doc__ = method.__doc__
+    return wrapper
+
+
 class ZimeNativeCallbacks:
     def __init__(self, *, max_dump=4096, read_iov_payload=False, udp_transport=None):
         self.max_dump = int(max_dump)
@@ -1054,6 +1082,7 @@ class ZimeNativeCallbacks:
             spec["iovPayloadSegments"] = segments
         return specs
 
+    @_native_callback_safe
     def _on_transport_send(self, socket_param, channel_id, buf, length):
         data = self._dump_ptr(buf, length)
         self.records.append({
@@ -1073,6 +1102,7 @@ class ZimeNativeCallbacks:
             )
         return 0
 
+    @_native_callback_safe
     def _on_transport_batch(self, packet_specs, count):
         count_int = int(count or 0)
         raw = self._dump_ptr(packet_specs, count_int * zime_probe.ZIME_PACKET_OUT_SPEC_SIZE)
@@ -1178,6 +1208,7 @@ class ZimeNativeCallbacks:
                 )
         return 0
 
+    @_native_callback_safe
     def _on_channel_data(self, channel_id, stream_id, buf, length):
         data = self._dump_ptr(buf, length)
         self.records.append({
@@ -1191,6 +1222,7 @@ class ZimeNativeCallbacks:
         })
         return 0
 
+    @_native_callback_safe
     def _on_channel_created(self, channel_id, value, status, err, protocol):
         self.records.append({
             "event": "native_channel_created",
@@ -1201,6 +1233,7 @@ class ZimeNativeCallbacks:
             "protocol": int(protocol),
         })
 
+    @_native_callback_safe
     def _on_channel_destroyed(self, channel_id, status, err):
         self.records.append({
             "event": "native_channel_destroyed",
@@ -1209,6 +1242,7 @@ class ZimeNativeCallbacks:
             "err": int(err),
         })
 
+    @_native_callback_safe
     def _on_channel_stream_blocked(self, channel_id, stream_id, blocked, reason):
         self.records.append({
             "event": "native_channel_stream_blocked",
@@ -1400,6 +1434,12 @@ class ZimeNativeBridge:
             })
             return completed
 
+        # Track native handles so the finally block can destroy them in reverse
+        # order. Initialized to None here so the finally can reference them even
+        # when an early fail() skips later creation steps (no AttributeError).
+        channel_handle = None  # ZIME_CreateDataChannel id (c_long value)
+        stream_handle = None   # ZIME_CreateDataStream id (c_long value)
+
         try:
             if not engine:
                 fail("ZIME_CreateDataEngine returned NULL")
@@ -1454,6 +1494,8 @@ class ZimeNativeBridge:
             if ret != 0:
                 fail(f"ZIME_CreateDataChannel failed: {ret}")
 
+            channel_handle = int(channel_id.value)
+
             for _index in range(max(0, int(process_ticks))):
                 process_channel(channel_id.value, phase="after_create_channel", tick_count=1)
                 drain_udp(channel_id.value, socket_param_ptr, phase="after_create_channel")
@@ -1473,6 +1515,8 @@ class ZimeNativeBridge:
             })
             if ret != 0:
                 fail(f"ZIME_CreateDataStream failed: {ret}")
+
+            stream_handle = int(stream_id_ref.value)
 
             buffers = []
             for payload in payloads:
@@ -1498,6 +1542,27 @@ class ZimeNativeBridge:
             return report
         finally:
             udp_transport.close()
+            # Release native handles in reverse creation order. Each destroy
+            # call is guarded: the .so may not export these symbols (they are
+            # in OPTIONAL_EXPORTS) and an earlier fail() may have skipped a
+            # creation step. Best-effort — never let cleanup mask the original
+            # error or crash the bridge.
+            try:
+                if stream_handle is not None:
+                    _destroy = getattr(self.lib, "ZIME_DestroyDataStream", None)
+                    if _destroy is not None:
+                        _destroy(engine, ctypes.c_long(int(stream_handle)))
+                if channel_handle is not None:
+                    _destroy = getattr(self.lib, "ZIME_DestroyDataChannel", None)
+                    if _destroy is not None:
+                        _destroy(engine, ctypes.c_long(int(channel_handle)))
+                if engine:
+                    # No documented ZIME_DestroyDataEngine export; best-effort.
+                    _destroy = getattr(self.lib, "ZIME_DestroyDataEngine", None)
+                    if _destroy is not None:
+                        _destroy(engine)
+            except Exception:
+                pass
 
 
 def run_research_probe(

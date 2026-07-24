@@ -868,7 +868,15 @@ def _round_seconds(duration: Optional[int]) -> int:
 
 
 def _scg_probe_socket(sock: socket.socket) -> None:
-    """Non-consuming liveness check via select.select."""
+    """Non-consuming liveness check via select.select.
+
+    Note: a deeper peek (recv(MSG_PEEK)) would catch a half-closed socket here,
+    but ``ssl.SSLSocket.recv`` rejects non-zero flags (``ValueError``), and this
+    socket is always the TLS-wrapped one. We rely on the immediately-following
+    ``_scg_sleep_drain`` → ``recv_all_frames`` → ``_recv_exact`` to raise
+    ``EOFError`` when ``recv`` returns b"" (peer FIN). So a half-close is
+    detected at most one cycle later rather than held forever.
+    """
     try:
         r, _, _ = select.select([sock], [], [], 0.0)
     except (ValueError, OSError):

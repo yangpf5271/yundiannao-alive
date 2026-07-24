@@ -42,6 +42,12 @@ from .zte_cag_proxy import (
 
 __all__ = ["CAGMux", "CAGMuxLink", "open_cag_mux_link"]
 
+# Backpressure ceiling for a single link's read buffer. If a consumer thread
+# (e.g. a sub-channel keepalive thread) stalls or dies, the server keeps pushing
+# display frames (~21 Hz) and _rbuf would grow unbounded -> OOM. When the buffer
+# exceeds this the link is marked closed (overflow) instead of accepting more.
+MAX_RBUF = 8 * 1024 * 1024
+
 
 class CAGMuxLink:
     """One virtual link inside a :class:`CAGMux` (port of B's ``CAGMuxLink``)."""
@@ -120,6 +126,14 @@ class CAGMuxLink:
     # -- internal: called by CAGMux.readLoop under mux lock ---------------
     def _append(self, payload: bytes) -> None:
         with self._cond:
+            # Backpressure: if the consumer is stalled/dead, cap growth rather
+            # than letting display frames accumulate without bound (OOM). Mark
+            # the link closed with an overflow error; readers will see EOF.
+            if len(self._rbuf) + len(payload) > MAX_RBUF:
+                self._closed = True
+                self._close_err = BufferError("CAGMuxLink read buffer overflow (consumer too slow)")
+                self._cond.notify_all()
+                return
             self._rbuf.extend(payload)
             self._cond.notify_all()
 
@@ -161,6 +175,13 @@ class CAGMux:
     def __init__(self, conn: socket.socket):
         self.conn = conn
         self._mu = threading.Lock()
+        # Separate write lock: multiple threads (main-link keepalive + each
+        # sub-channel keepalive) call write_frame concurrently. sendall on an
+        # SSL socket may issue several underlying write() syscalls; without a
+        # write lock their bytes interleave and the peer sees corrupt CAG frames
+        # (header/payload misaligned). _mu guards the link table; _write_mu
+        # serializes only the socket write so it doesn't block the read loop.
+        self._write_mu = threading.Lock()
         self._links: Dict[int, CAGMuxLink] = {}
         self._next_link_id = 1
         self._closed = False
@@ -232,7 +253,12 @@ class CAGMux:
             params, link_id, link_uuid, trace_id, span_id
         )
         try:
-            self.conn.sendall(packet)
+            # Serialize the socket write with write_frame so concurrent open_link
+            # / write_frame calls don't interleave TLS records (see _write_mu).
+            with self._write_mu:
+                if self._closed:
+                    raise RuntimeError("cag mux closed")
+                self.conn.sendall(packet)
         except OSError:
             with self._mu:
                 self._links.pop(link_id, None)
@@ -245,7 +271,12 @@ class CAGMux:
             if self._closed:
                 raise RuntimeError("cag mux closed")
             frame = pack_frame(cmd, link_id, payload)
-        self.conn.sendall(frame)
+        # Serialize the socket write itself so concurrent writers don't
+        # interleave TLS records (see _write_mu docstring in __init__).
+        with self._write_mu:
+            if self._closed:
+                raise RuntimeError("cag mux closed")
+            self.conn.sendall(frame)
 
     # -- close ------------------------------------------------------------
     def close(self) -> None:
