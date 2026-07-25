@@ -400,6 +400,15 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
     # Display heartbeat (type=3) injection — mimics screen-refresh traffic
     # observed in pcapng at ~21 Hz.  The body's varying u32 increments
     # ~250 every ~5 packets.
+    # Diagnostic: CCK_ZTE_READONLY_KEEPALIVE=1 suppresses all outbound frames
+    # (no tick display/input init, no heartbeat) so we can tell whether the
+    # gateway closes because of frames WE send vs. something earlier.
+    _readonly = os.environ.get("CCK_ZTE_READONLY_KEEPALIVE", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if _readonly:
+        heartbeat_hz = 0.0
+        print("[zte-frame] READONLY keepalive: suppressing tick + heartbeat sends "
+              "(read-only diagnosis)", flush=True)
     hb_interval = (1.0 / heartbeat_hz) if heartbeat_hz and heartbeat_hz > 0 else None
     next_hb = started
     hb_counter = 0
@@ -438,7 +447,7 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                      [(hex(t), n) for t, n in _last_recv_types]), flush=True)
             break
         now = time.time()
-        if now >= next_tick:
+        if now >= next_tick and not _readonly:
             try:
                 disp = rawMessageWithPrefix(state.nextSerial(), BuildZTERawDisplayInit())
                 inp = rawMessageWithPrefix(state.nextSerial(), BuildZTERawInputInit())
