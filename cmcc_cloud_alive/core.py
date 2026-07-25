@@ -253,13 +253,88 @@ def merge_state(patch, args=None):
     return state
 
 
+def _read_dmi(name):
+    """Best-effort read of a Linux DMI/SMBIOS field (board serial, vendor, model).
+
+    Mirrors what the official Electron client reads via the `systeminformation`
+    npm module. Returns "" when unavailable (non-Linux, no permission, no DMI).
+    Callers fall back to platform-derived defaults, matching the client's
+    own fallback chain.
+    """
+    for path in (f"/sys/class/dmi/id/{name}", f"/sys/devices/virtual/dmi/id/{name}"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                value = f.read().strip()
+            if value and value.lower() not in ("-", "default string", "to be filled by o.e.m.", "none"):
+                return value
+        except OSError:
+            continue
+    return ""
+
+
+def gen_soho_uuid():
+    """X-SOHO-Uuid value matching the official client's generateRandomName().
+
+    Format: ``uuid_`` + 32 uppercase hex digits, with UUIDv4 variant/version
+    bits set (char 12 = '4', char 16 in '89AB'). Replaces the old lowercase
+    rand_id(32) which lacked the prefix and version bits.
+    """
+    raw = list(secrets.token_hex(16).upper())  # 32 hex chars
+    raw[12] = "4"  # version 4
+    raw[16] = "89AB"[secrets.randbelow(4)]  # RFC 4122 variant
+    return "uuid_" + "".join(raw)
+
+
+DEVICE_ID_VERSION = 2  # bump to invalidate previously-persisted deviceIds
+_DEVICE_ID_SALT = f"cmcc-alive-deviceid-v{DEVICE_ID_VERSION}"
+
+
+def derive_device_id(username):
+    """Deterministically derive a stable, per-account deviceId.
+
+    Form: ``{8-hex-serial}-{02:XX:XX:XX:XX:XX}`` — an OEM-style board serial
+    joined with a locally-administered MAC, both derived from sha256(salt:user).
+
+    Why deterministic (not random / not hardware):
+      - Containers (Docker on Synology etc.) yield unstable ``uuid.getnode()``
+        and unreliable DMI, so hardware-derived ids drift across restarts and
+        trigger risk control ("same account on a different device").
+      - One container often runs MANY accounts; sharing one hardware id makes
+        that look like multi-open on a single device. A per-account id avoids it.
+      - Same account → same id forever (stable), different accounts → different
+        ids, with no hardware dependency.
+
+    The version salt lets us invalidate older persisted ids by bumping
+    DEVICE_ID_VERSION: a stored id whose version no longer matches is discarded
+    and re-derived (see profile_device_id).
+    """
+    acct = str(username or "")
+    h = hashlib.sha256(f"{_DEVICE_ID_SALT}:{acct}".encode("utf-8")).hexdigest().upper()
+    serial = h[:8]
+    b = bytes.fromhex(h[8:20])[:6]
+    mac_bytes = bytearray(b)
+    mac_bytes[0] = (mac_bytes[0] & 0xFE) | 0x02  # locally administered, unicast
+    mac = ":".join(f"{x:02X}" for x in mac_bytes)
+    return f"{serial}-{mac}"
+
+
 def default_device_id():
-    host = socket.gethostname() or "linux"
+    """Default X-SOHO-DeviceId when no account is known yet (e.g. pre-login).
+
+    Prefers a real Linux board serial when available (true-machine form), else
+    derives a stable id from the host so the value doesn't drift. Once a profile
+    logs in, profile_device_id switches to the per-account derived id.
+    """
+    serial = _read_dmi("board_serial")
     mac = uuid.getnode()
-    if (mac >> 40) % 2:
-        return host
-    mac_text = ":".join(f"{(mac >> shift) & 0xff:02x}" for shift in range(40, -1, -8))
-    return f"{host}-{mac_text}"
+    mac_text = ""
+    if not ((mac >> 40) % 2):  # valid MAC (locally administered bit clear)
+        mac_text = ":".join(f"{(mac >> shift) & 0xff:02x}" for shift in range(40, -1, -8))
+    if serial and mac_text:
+        return f"{serial}-{mac_text}"
+    # No reliable hardware id (common in containers): derive a stable one from
+    # the hostname so it doesn't change every restart.
+    return derive_device_id(socket.gethostname() or "linux")
 
 
 def rand_id(length=32):
@@ -298,38 +373,87 @@ def client_config(state=None):
 
 
 def profile_device_id(state, cfg):
-    return (
-        state.get("clientDeviceId")
-        or state.get("deviceId")
-        or cfg.get("device_id")
-        or default_device_id()
-    )
+    """Resolve X-SOHO-DeviceId for the current profile.
+
+    Priority:
+      1. ``clientDeviceId`` — imported from a real client capture (HAR), the
+         truest machine fingerprint; always wins.
+      2. ``deviceId`` — previously persisted id, but ONLY if it matches the
+         current DEVICE_ID_VERSION. A stale (older-version) id is discarded so a
+         bump silently re-derives per-account ids (see derive_device_id).
+      3. per-account derived id from the profile's username — stable, unique per
+         account, no hardware dependency (container-friendly).
+      4. ``cfg.device_id`` / default_device_id() — last resort (no username).
+    """
+    # 1. HAR-imported real client id always wins.
+    client = state.get("clientDeviceId")
+    if client:
+        return client
+    # 2. Persisted id, but only if it's the current version.
+    persisted = state.get("deviceId")
+    persisted_ver = state.get("deviceIdVersion")
+    if persisted and persisted_ver == DEVICE_ID_VERSION:
+        return persisted
+    # 3. Per-account derived id (stable, unique per account).
+    username = state.get("username") or state.get("phone") or ""
+    if username:
+        return derive_device_id(username)
+    # 4. Last resort.
+    return cfg.get("device_id") or default_device_id()
+
+
+def _os_release():
+    """os.release() equivalent (kernel/OS release string), cross-platform."""
+    try:
+        return os.uname().release
+    except (AttributeError, OSError):
+        return ""
 
 
 def profile_app_type(state, cfg, device_id):
+    """X-SOHO-AppType matching the client's 7-segment form.
+
+    Client format (src/main/init.js):
+        ``${platform}|${release}|${model}|${net}|-1|${serial}|``
+    where release=os.release(), model=system model, net='0' (wired, the
+    client's getNetworkStatus() effectively always returns 0), serial=deviceId.
+    """
     if state.get("clientAppType"):
         return state["clientAppType"]
     if state.get("appType"):
         return state["appType"]
-    platform = cfg.get("platform") or "Linux"
-    if platform.lower() == "windows":
-        return f"windows|10.0.22631|Windows-PC|1|-1|{device_id}|"
-    if platform.lower() == "mac":
-        return f"mac|24.2.0|Mac|1|-1|{device_id}|"
-    return f"{platform}|{cfg['version']}|{platform}|-1|-1|{device_id}|"
+    platform = (cfg.get("platform") or "Linux").lower()
+    release = _read_dmi("product_version") or _os_release()
+    if platform == "linux":
+        model = _read_dmi("product_name") or "linux"
+        return f"linux|{release}|{model}|0|-1|{device_id}|"
+    if platform == "windows":
+        return f"windows|{_os_release() or '10.0.22631'}|Windows-PC|1|-1|{device_id}|"
+    if platform == "mac":
+        return f"mac|{_os_release() or '24.2.0'}|Mac|1|-1|{device_id}|"
+    return f"{platform}|{release or cfg['version']}|{platform}|0|-1|{device_id}|"
 
 
 def profile_rom_version(state, cfg):
+    """X-SOHO-RomVersion matching the client's ``${manufacturer}-${release}``.
+
+    Client (src/main/init.js): manufacturer from systeminformation (falls back
+    to model), release=os.release(). On non-Linux or without DMI we keep
+    sensible defaults close to a real machine of that platform.
+    """
     if state.get("clientRomVersion"):
         return state["clientRomVersion"]
     if state.get("romVersion"):
         return state["romVersion"]
-    platform = cfg.get("platform") or "Linux"
-    if platform.lower() == "windows":
-        return "Microsoft Windows-10.0.22631"
-    if platform.lower() == "mac":
-        return "Apple Inc.-24.2.0"
-    return f"{platform}-{cfg['version']}"
+    platform = (cfg.get("platform") or "Linux").lower()
+    if platform == "linux":
+        manufacturer = _read_dmi("sys_vendor") or _read_dmi("product_name") or "linux"
+        return f"{manufacturer}-{_os_release() or cfg['version']}"
+    if platform == "windows":
+        return f"Microsoft Corporation-{_os_release() or '10.0.22631'}"
+    if platform == "mac":
+        return f"Apple Inc.-{_os_release() or '24.2.0'}"
+    return f"{platform}-{_os_release() or cfg['version']}"
 
 
 def profile_user_agent(state, cfg):
@@ -768,7 +892,7 @@ def headers(state, url_path, method, body):
         "X-SOHO-SohoToken": state.get("sohoToken") or "",
         "X-SOHO-Timestamp": str(int(time.time() * 1000)),
         "X-SOHO-UserId": state.get("userId") or "",
-        "X-SOHO-Uuid": rand_id(32),
+        "X-SOHO-Uuid": gen_soho_uuid(),
         "X-SOHO-VersionNum": cfg["version_num"],
     }
     all_headers = {
@@ -855,7 +979,17 @@ def ensure_public_key(args=None):
         return state["publicKey"]
     response = api_request("/login/encryptKey/v1", None, args)
     assert_ok(response, "encryptKey")
-    merge_state({"publicKey": response["data"], "deviceId": state.get("deviceId") or default_device_id()}, args)
+    # Resolve deviceId via profile_device_id (per-account derived, version-aware)
+    # and persist it with the current version so future reads reuse it.
+    # On first login state has no username yet, so prefer args.username (the
+    # login form value) so the per-account id is derived correctly up front.
+    cfg = client_config(state)
+    id_state = dict(state)
+    args_user = getattr(args, "username", None) or getattr(args, "subAccount", None)
+    if args_user and not id_state.get("username"):
+        id_state["username"] = args_user
+    device_id = profile_device_id(id_state, cfg)
+    merge_state({"publicKey": response["data"], "deviceId": device_id, "deviceIdVersion": DEVICE_ID_VERSION}, args)
     return response["data"]
 
 
@@ -917,10 +1051,11 @@ def sub_password_login(args):
 
 def protocol_check(args):
     state = load_state(args)
-    device_id = state.get("deviceId") or default_device_id()
+    device_id = profile_device_id(state, client_config(state))
     base_state = dict(state)
     base_state.update({
         "deviceId": device_id,
+        "deviceIdVersion": DEVICE_ID_VERSION,
         "publicKey": "",
         "sohoToken": "",
         "userId": "",
