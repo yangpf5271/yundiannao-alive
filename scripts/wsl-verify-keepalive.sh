@@ -25,14 +25,21 @@ cd "$ROOT"
 PROTOCOL="ZTE"
 ACCOUNT=""
 ACCOUNT_ARG=()
+FORCE_PROBE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --protocol) PROTOCOL="$2"; shift 2 ;;
         --account) ACCOUNT="$2"; ACCOUNT_ARG=(--username "$2"); shift 2 ;;
+        --force-probe) FORCE_PROBE=1; shift ;;
         -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
+
+if [[ $FORCE_PROBE -eq 1 ]]; then
+    export CCK_ZTE_FORCE_PROBE=1
+    echo "[flag] CCK_ZTE_FORCE_PROBE=1 (忽略 sticky edge 缓存，重新探测)"
+fi
 
 case "$PROTOCOL" in
     ZTE|zte|SCG|scg) PROTOCOL=$(echo "$PROTOCOL" | tr '[:lower:]' '[:upper:]') ;;
