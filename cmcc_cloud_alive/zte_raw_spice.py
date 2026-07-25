@@ -389,6 +389,14 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
     counters = {"messages": 0, "autoReplies": 0, "ticks": 0, "errors": 0,
                 "heartbeats": 0, "display_type3_heartbeat_frames": 0,
                 "heartbeat_hz": heartbeat_hz}
+    # Frame-level diagnostics: capture the first send of each kind and the last
+    # few received msg_types, so a premature EOFError leaves a trail of what the
+    # client sent and what the gateway last replied before closing. Reversed
+    # against the official bootCypc/libspice ground truth (CAG outband proxy
+    # keepalive = 4 bytes 0a 00 00 00 every 5s; SPICE main heartbeat is passive
+    # ACK type=0x79). Only first-of-kind sends are logged to avoid flooding.
+    _sent_logged = {"tick_display": False, "tick_input": False, "heartbeat": False}
+    _last_recv_types = []  # last 8 received (msg_type, payload_len)
     # Display heartbeat (type=3) injection — mimics screen-refresh traffic
     # observed in pcapng at ~21 Hz.  The body's varying u32 increments
     # ~250 every ~5 packets.
@@ -407,6 +415,12 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
         try:
             msg_type, payload = state.ReadMessage(conn, read_timeout)
             counters["messages"] += 1
+            _last_recv_types.append((msg_type, len(payload)))
+            if len(_last_recv_types) > 8:
+                _last_recv_types.pop(0)
+            if counters["messages"] <= 3:
+                print("[zte-frame] recv #%d: msg_type=0x%04x payload_len=%d"
+                      % (counters["messages"], msg_type, len(payload)), flush=True)
             if state.AutoReply(conn, msg_type, payload):
                 counters["autoReplies"] += 1
         except (socket.timeout, TimeoutError):
@@ -419,23 +433,29 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
             counters["errors"] += 1
             counters["last_error"] = f"{type(exc).__name__}: {exc}"
             counters["last_error_phase"] = "read"
-            logging.getLogger(__name__).warning(
-                "keepaliveRawSpiceLoop read error after %.1fs (breaking loop): %s",
-                time.time() - started, counters["last_error"])
+            print("[zte-frame] read error after %.1fs (breaking): %s | last_recv_types=%s"
+                  % (time.time() - started, counters["last_error"],
+                     [(hex(t), n) for t, n in _last_recv_types]), flush=True)
             break
         now = time.time()
         if now >= next_tick:
             try:
-                conn.sendall(rawMessageWithPrefix(state.nextSerial(), BuildZTERawDisplayInit()))
-                conn.sendall(rawMessageWithPrefix(state.nextSerial(), BuildZTERawInputInit()))
+                disp = rawMessageWithPrefix(state.nextSerial(), BuildZTERawDisplayInit())
+                inp = rawMessageWithPrefix(state.nextSerial(), BuildZTERawInputInit())
+                conn.sendall(disp)
+                conn.sendall(inp)
+                if not _sent_logged["tick_display"]:
+                    print("[zte-frame] 1st tick send -> main_link: "
+                          "display_init=%s  input_init=%s"
+                          % (disp[:32].hex(), inp[:32].hex()), flush=True)
+                    _sent_logged["tick_display"] = True
                 counters["ticks"] += 1
             except Exception as exc:
                 counters["errors"] += 1
                 counters["last_error"] = f"{type(exc).__name__}: {exc}"
                 counters["last_error_phase"] = "tick_send"
-                logging.getLogger(__name__).warning(
-                    "keepaliveRawSpiceLoop tick send error after %.1fs (breaking loop): %s",
-                    time.time() - started, counters["last_error"])
+                print("[zte-frame] tick send error after %.1fs (breaking): %s"
+                      % (time.time() - started, counters["last_error"]), flush=True)
                 break
             next_tick = now + interval
         if hb_interval and now >= next_hb:
@@ -448,6 +468,14 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                 targets = display_links if display_links else [conn]
                 for link in targets:
                     link.sendall(hb_msg)
+                if not _sent_logged["heartbeat"]:
+                    link_ids = []
+                    for tl in targets:
+                        link_ids.append(getattr(tl, "link_id", "main"))
+                    print("[zte-frame] 1st heartbeat send -> links=%s: "
+                          "hb_msg=%s (len=%d, 21Hz type=3)"
+                          % (link_ids, hb_msg[:32].hex(), len(hb_msg)), flush=True)
+                    _sent_logged["heartbeat"] = True
                 counters["heartbeats"] += 1
                 counters["display_type3_heartbeat_frames"] += len(targets)
                 hb_seq += 1
@@ -468,9 +496,8 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                 counters["errors"] += 1
                 counters["last_error"] = f"{type(exc).__name__}: {exc}"
                 counters["last_error_phase"] = "heartbeat_send"
-                logging.getLogger(__name__).warning(
-                    "keepaliveRawSpiceLoop heartbeat send error after %.1fs (breaking loop): %s",
-                    time.time() - started, counters["last_error"])
+                print("[zte-frame] heartbeat send error after %.1fs (breaking): %s"
+                      % (time.time() - started, counters["last_error"]), flush=True)
                 break
             next_hb = now + hb_interval
     return counters
