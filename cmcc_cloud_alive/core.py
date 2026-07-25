@@ -285,7 +285,7 @@ def gen_soho_uuid():
     return "uuid_" + "".join(raw)
 
 
-DEVICE_ID_VERSION = 4  # bump to invalidate previously-persisted deviceIds (v4: OEM-style serial)
+DEVICE_ID_VERSION = 5  # bump to invalidate previously-persisted deviceIds (v5: lowercase MAC)
 _DEVICE_ID_SALT = f"cmcc-alive-deviceid-v{DEVICE_ID_VERSION}"
 # OEM board-serial alphabet: digits + uppercase letters minus confusables (0/O/1/I).
 # Mirrors how real vendors (Lenovo PF0ABCDE, Dell 7-char tag, HP 5CD...) encode
@@ -327,7 +327,10 @@ def derive_device_id(username):
     # high nibble (e.g. 0x56/0x92) is neither a real OUI nor a standard local
     # address, and stands out as algorithmically generated.
     mac_bytes[0] = 0x02
-    mac = ":".join(f"{x:02X}" for x in mac_bytes)
+    # MAC is lowercase colon-separated, matching Node.js os.networkInterfaces()
+    # iface.mac format (the official client stores iface.mac into the `ip` var
+    # and concatenates `${serial}-${ip}`). Uppercase here would mismatch.
+    mac = ":".join(f"{x:02x}" for x in mac_bytes)
     return f"{serial}-{mac}"
 
 
