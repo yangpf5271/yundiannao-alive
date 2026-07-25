@@ -411,8 +411,17 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                 counters["autoReplies"] += 1
         except (socket.timeout, TimeoutError):
             pass
-        except Exception:
+        except Exception as exc:
+            # Connection broke mid-read. Keep the original break (one-round
+            # tolerance), but record the cause so it isn't silently swallowed
+            # — otherwise the caller reports ok=True with a short duration and
+            # no clue why the loop exited early.
             counters["errors"] += 1
+            counters["last_error"] = f"{type(exc).__name__}: {exc}"
+            counters["last_error_phase"] = "read"
+            logging.getLogger(__name__).warning(
+                "keepaliveRawSpiceLoop read error after %.1fs (breaking loop): %s",
+                time.time() - started, counters["last_error"])
             break
         now = time.time()
         if now >= next_tick:
@@ -420,8 +429,13 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                 conn.sendall(rawMessageWithPrefix(state.nextSerial(), BuildZTERawDisplayInit()))
                 conn.sendall(rawMessageWithPrefix(state.nextSerial(), BuildZTERawInputInit()))
                 counters["ticks"] += 1
-            except Exception:
+            except Exception as exc:
                 counters["errors"] += 1
+                counters["last_error"] = f"{type(exc).__name__}: {exc}"
+                counters["last_error_phase"] = "tick_send"
+                logging.getLogger(__name__).warning(
+                    "keepaliveRawSpiceLoop tick send error after %.1fs (breaking loop): %s",
+                    time.time() - started, counters["last_error"])
                 break
             next_tick = now + interval
         if hb_interval and now >= next_hb:
@@ -450,8 +464,13 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
                         hb_burst_frames, burst_dur, approx_hz)
                     hb_burst_start = now
                     hb_burst_frames = 0
-            except Exception:
+            except Exception as exc:
                 counters["errors"] += 1
+                counters["last_error"] = f"{type(exc).__name__}: {exc}"
+                counters["last_error_phase"] = "heartbeat_send"
+                logging.getLogger(__name__).warning(
+                    "keepaliveRawSpiceLoop heartbeat send error after %.1fs (breaking loop): %s",
+                    time.time() - started, counters["last_error"])
                 break
             next_hb = now + hb_interval
     return counters

@@ -1719,6 +1719,23 @@ def _run_zte_keepalive(args, auth, route, vm_id, report, started):
             )
             report["stage"] = "zte-keepalive-done"
             report["keepalive"] = counters
+            # Surface early-exit / partial-round cases. keepaliveRawSpiceLoop
+            # breaks on a non-timeout error (recorded in counters["errors"] /
+            # last_error) but does not raise, so without this the outer report
+            # shows ok=True with a short duration and no clue the loop aborted.
+            _errs = int(counters.get("errors") or 0)
+            if _errs > 0:
+                report["partial"] = True
+                report["keepalive_errors"] = _errs
+                report["keepalive_last_error"] = counters.get("last_error") or ""
+                report["keepalive_last_error_phase"] = counters.get("last_error_phase") or ""
+                print(
+                    "[%s] ZTE 保活提前结束（errors=%d, phase=%s）：%s"
+                    % (core.short_time(), _errs,
+                       report["keepalive_last_error_phase"],
+                       report["keepalive_last_error"]),
+                    flush=True,
+                )
             report["nextStep"] = "session completed; inspect counters"
         except Exception as exc:  # noqa: BLE001 - surface CAG/mux/raw failure
             report["stage"] = "zte-keepalive-failed"
