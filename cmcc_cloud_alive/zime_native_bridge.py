@@ -306,8 +306,17 @@ def make_sockaddr_in(host="127.0.0.1", port=0):
     return addr
 
 
-def make_init_param(role=0, support_protocol=0, reserve_udp_payload_4bytes=1):
+def make_init_param(role=0, support_protocol=0, reserve_udp_payload_4bytes=1, lib=None):
     param = ZimeInitParam()
+    # Let the .so populate correct defaults first (the struct has ~52 bytes of
+    # opaque fields between eZIMEDCRole and eZIMESupportDCProtocol that we do
+    # not map). Falls back to zero-init if the export is absent.
+    default_fn = getattr(lib, "DefaultZIMEInitParam", None) if lib else None
+    if default_fn:
+        try:
+            default_fn(ctypes.byref(param))
+        except Exception:
+            pass
     param.eZIMEDCRole = int(role)
     param.eZIMESupportDCProtocol = int(support_protocol)
     param.bUDPPayloadReserve4Bytes = int(reserve_udp_payload_4bytes)
@@ -346,8 +355,18 @@ def make_channel_context(
     return context, [local, remote]
 
 
-def make_stream_param(mode=1, support_drop_data=0, priority=0x7F, max_bandwidth=0xFFFFFFFF, payload_type=b""):
+def make_stream_param(mode=1, support_drop_data=0, priority=0x7F, max_bandwidth=0xFFFFFFFF, payload_type=b"", lib=None):
     param = ZimeStreamParam()
+    # ZimeStreamParam is non-POD (carries a unique_ptr per the .so's mangled
+    # symbol _T_ZIMEStreamParamSt14default_delete). Let the .so initialize it
+    # via DefaultZIMEStreamParam so internal pointers are set up correctly;
+    # then override only the business fields. Zero-init alone risks a crash.
+    default_fn = getattr(lib, "DefaultZIMEStreamParam", None) if lib else None
+    if default_fn:
+        try:
+            default_fn(ctypes.byref(param))
+        except Exception:
+            pass
     param.mode = int(mode)
     param.supportDropData = int(support_drop_data)
     param.u8Priority = int(priority)
@@ -427,6 +446,36 @@ def _bind_library(lib):
     if getattr(lib, "ZIME_GetInfoByErrno", None):
         lib.ZIME_GetInfoByErrno.argtypes = [ctypes.c_int]
         lib.ZIME_GetInfoByErrno.restype = ctypes.c_char_p
+
+    # DefaultZIME* let the .so fill a struct's correct defaults before we
+    # override business fields. Critical for ZimeStreamParam: it carries a
+    # unique_ptr (non-POD), so zero-init risks a crash/leak.
+    if getattr(lib, "DefaultZIMEInitParam", None):
+        lib.DefaultZIMEInitParam.argtypes = [ctypes.c_void_p]
+        lib.DefaultZIMEInitParam.restype = ctypes.c_int
+    if getattr(lib, "DefaultZIMEStreamParam", None):
+        lib.DefaultZIMEStreamParam.argtypes = [ctypes.c_void_p]
+        lib.DefaultZIMEStreamParam.restype = ctypes.c_int
+
+    # Cleanup: ZIME_Release frees the engine (there is no ZIME_DestroyDataEngine
+    # export; Release is the documented teardown). Destroy* are channel/stream.
+    if getattr(lib, "ZIME_Release", None):
+        lib.ZIME_Release.argtypes = [ctypes.c_void_p]
+        lib.ZIME_Release.restype = ctypes.c_int
+    if getattr(lib, "ZIME_DestroyDataChannel", None):
+        lib.ZIME_DestroyDataChannel.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        lib.ZIME_DestroyDataChannel.restype = ctypes.c_int
+    if getattr(lib, "ZIME_DestroyDataStream", None):
+        lib.ZIME_DestroyDataStream.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_long]
+        lib.ZIME_DestroyDataStream.restype = ctypes.c_int
+
+    # Optional diagnostics exports (guarded; not all .so builds ship them).
+    if getattr(lib, "ZIME_ForceOutputEngineLog", None):
+        lib.ZIME_ForceOutputEngineLog.argtypes = [ctypes.c_void_p]
+        lib.ZIME_ForceOutputEngineLog.restype = ctypes.c_int
+    if getattr(lib, "ZIME_GetVersionInfo", None):
+        lib.ZIME_GetVersionInfo.argtypes = [ctypes.c_void_p]
+        lib.ZIME_GetVersionInfo.restype = ctypes.c_char_p
     return lib
 
 
@@ -444,6 +493,38 @@ def _error_info(lib, code):
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def dump_engine_diagnostics(lib, engine, records=None):
+    """Best-effort engine diagnostics for debugging native probe runs.
+
+    Calls the optional diagnostic exports (version, force-log-flush) that
+    _bind_library wires when present. Returns a dict; never raises — safe to
+    call in finally/report paths. ``records`` (if given) is the callback
+    record list to append an event to.
+    """
+    out = {"version": None, "logFlushed": False}
+    try:
+        version_fn = getattr(lib, "ZIME_GetVersionInfo", None)
+        if version_fn and engine:
+            raw = version_fn(engine)
+            if raw:
+                out["version"] = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    except Exception as e:
+        out["versionError"] = f"{e.__class__.__name__}: {e}"
+    try:
+        flush_fn = getattr(lib, "ZIME_ForceOutputEngineLog", None)
+        if flush_fn and engine:
+            flush_fn(engine)
+            out["logFlushed"] = True
+    except Exception as e:
+        out["logFlushError"] = f"{e.__class__.__name__}: {e}"
+    if records is not None:
+        try:
+            records.append({"event": "engine_diagnostics", **out, "traceOnly": True})
+        except Exception:
+            pass
+    return out
 
 
 def native_bridge_milestones(report):
@@ -1356,6 +1437,8 @@ class ZimeNativeBridge:
                 ),
             }
             report["nativeMilestones"] = native_bridge_milestones(report)
+            # Engine version + forced log flush, for debugging (best-effort).
+            report["engineDiagnostics"] = dump_engine_diagnostics(self.lib, engine, callbacks.records)
             return report
 
         def fail(message):
@@ -1444,7 +1527,7 @@ class ZimeNativeBridge:
             if not engine:
                 fail("ZIME_CreateDataEngine returned NULL")
 
-            init_param = make_init_param()
+            init_param = make_init_param(lib=self.lib)
             ret = self.lib.ZIME_Init(engine, ctypes.byref(init_param))
             calls.append({"function": "ZIME_Init", "ret": int(ret)})
             if ret != 0:
@@ -1503,7 +1586,7 @@ class ZimeNativeBridge:
             if not wait_for_channel_created(channel_id.value, socket_param_ptr):
                 fail("native_channel_created was not observed before stream creation")
 
-            stream_param = make_stream_param()
+            stream_param = make_stream_param(lib=self.lib)
             stream_id_ref = ctypes.c_long(int(stream_id))
             ret = self.lib.ZIME_CreateDataStream(engine, channel_id.value, ctypes.byref(stream_id_ref), ctypes.byref(stream_param))
             calls.append({
@@ -1557,10 +1640,12 @@ class ZimeNativeBridge:
                     if _destroy is not None:
                         _destroy(engine, ctypes.c_long(int(channel_handle)))
                 if engine:
-                    # No documented ZIME_DestroyDataEngine export; best-effort.
-                    _destroy = getattr(self.lib, "ZIME_DestroyDataEngine", None)
-                    if _destroy is not None:
-                        _destroy(engine)
+                    # Engine teardown is ZIME_Release (there is NO
+                    # ZIME_DestroyDataEngine export; Release is the documented
+                    # teardown — verified against the .so symbol table).
+                    _release = getattr(self.lib, "ZIME_Release", None)
+                    if _release is not None:
+                        _release(engine)
             except Exception:
                 pass
 
