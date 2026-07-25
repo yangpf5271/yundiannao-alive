@@ -1327,11 +1327,41 @@ def run_zte_keepalive_session(firm: ZTEFirmAuth, connect_str: str, *,
         sub_threads.append(t)
 
     # --- P9: main keepalive loop (blocks for *duration* seconds) ---
+    # IPv4-CAGMux gateway rejects the SPICE type=3 heartbeat / DisplayInit the
+    # loop used to inject proactively (verified: passive-only mode holds 60s+,
+    # proactive frames get the connection closed in 0.1s). The official client
+    # keeps this channel alive with a 4-byte outband-proxy heartbeat
+    # (CAG_PROXY_DATA_CMD=0x0a, linkID=0, len=0 → 0a 00 00 00) every 5s
+    # (reverse-engineered from libspice-client-glib-zte deal_outband_proxy_
+    # fd_session_heartbeat @0x16308e). Send that on a background thread and run
+    # the SPICE loop in passive_only mode (auto-reply PING/MOUSE_MODE only).
+    import threading as _threading
+    from .zte_cag_proxy import CAG_PROXY_DATA_CMD as _OUTBAND_HB_CMD
+    _OUTBAND_HB_INTERVAL = 5.0
+
+    def _outband_heartbeat_loop(_mux, _stop):
+        sent = 0
+        while not _stop.is_set():
+            try:
+                _mux.write_frame(_OUTBAND_HB_CMD, 0, b"")  # → 0a 00 00 00
+                sent += 1
+            except Exception:
+                break
+            _stop.wait(_OUTBAND_HB_INTERVAL)
+        print("[zte-frame] outband heartbeat stopped (sent=%d)" % sent, flush=True)
+
+    outband_thread = _threading.Thread(
+        target=_outband_heartbeat_loop, args=(mux, stop_event),
+        daemon=True, name="zte-outband-hb")
+    outband_thread.start()
+    print("[zte-frame] outband heartbeat started: 0a000000 every %.0fs" % _OUTBAND_HB_INTERVAL,
+          flush=True)
     try:
         counters = keepaliveRawSpiceLoop(main_link, interval=25.0, stop_after=duration,
-                                         display_links=display_links)
+                                         display_links=display_links, passive_only=True)
     finally:
         stop_event.set()
+        outband_thread.join(timeout=3.0)
         for t in sub_threads:
             t.join(timeout=3.0)
 

@@ -371,7 +371,8 @@ def RawMainHandshake(conn, key: str, vmid: str, linkUUID: Optional[bytes], trace
 
 def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[float] = None,
                           heartbeat_hz: float = 21.0,
-                          display_links: Optional[list] = None) -> dict:
+                          display_links: Optional[list] = None,
+                          passive_only: bool = False) -> dict:
     """Read/auto-reply raw messages and periodically send display/input init.
 
     This is the Python route's conservative product keepalive loop: it preserves
@@ -403,12 +404,14 @@ def keepaliveRawSpiceLoop(conn, interval: float = 25.0, stop_after: Optional[flo
     # Diagnostic: CCK_ZTE_READONLY_KEEPALIVE=1 suppresses all outbound frames
     # (no tick display/input init, no heartbeat) so we can tell whether the
     # gateway closes because of frames WE send vs. something earlier.
-    _readonly = os.environ.get("CCK_ZTE_READONLY_KEEPALIVE", "").strip().lower() in (
+    # passive_only (caller-controlled, used by the IPv4-CAGMux path which sends
+    # the official outband 0x0a heartbeat separately) has the same effect.
+    _readonly = passive_only or os.environ.get("CCK_ZTE_READONLY_KEEPALIVE", "").strip().lower() in (
         "1", "true", "yes", "on")
     if _readonly:
         heartbeat_hz = 0.0
-        print("[zte-frame] READONLY keepalive: suppressing tick + heartbeat sends "
-              "(read-only diagnosis)", flush=True)
+        print("[zte-frame] passive keepalive: suppressing tick + heartbeat sends "
+              "(outband 0x0a heartbeat sent separately by caller)", flush=True)
     hb_interval = (1.0 / heartbeat_hz) if heartbeat_hz and heartbeat_hz > 0 else None
     next_hb = started
     hb_counter = 0
