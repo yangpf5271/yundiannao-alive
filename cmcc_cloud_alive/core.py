@@ -285,13 +285,32 @@ def gen_soho_uuid():
     return "uuid_" + "".join(raw)
 
 
-DEVICE_ID_VERSION = 5  # bump to invalidate previously-persisted deviceIds (v5: lowercase MAC)
+DEVICE_ID_VERSION = 6  # bump to invalidate previously-persisted deviceIds (v6: real-vendor OUI MAC)
 _DEVICE_ID_SALT = f"cmcc-alive-deviceid-v{DEVICE_ID_VERSION}"
 # OEM board-serial alphabet: digits + uppercase letters minus confusables (0/O/1/I).
 # Mirrors how real vendors (Lenovo PF0ABCDE, Dell 7-char tag, HP 5CD...) encode
 # serials — alphanumeric and typically containing non-hex letters, so a derived
 # serial doesn't read as a hex hash.
 _OEM_SERIAL_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+# Real vendor OUI prefixes (first 3 MAC bytes), IEEE-registered. Used so a
+# derived MAC reads as a physical NIC (U/L=0) rather than a software/VM address
+# (02:/06:...). Deliberately EXCLUDES virtualization OUIs (VMware 00:50:56,
+# QEMU 52:54:00, Hyper-V 00:15:5d) which would flag the device as virtual.
+# A MAC's OUI belongs to the NIC chip vendor (Intel/Realtek/...), NOT the
+# motherboard brand, so this does NOT need to match the RomVersion manufacturer.
+_VENDOR_OUI_POOL = (
+    "a4:1f:72",  # Intel (I219 onboard)
+    "00:1a:6b",  # Intel
+    "f8:0f:41",  # Intel
+    "00:e0:4c",  # Realtek (RTL8111 onboard, very common on desktop boards)
+    "00:13:3b",  # Realtek
+    "2c:fd:a1",  # Realtek (RTL8125)
+    "00:0c:29",  # Broadcom
+    "b8:ca:3a",  # ASUSTek
+    "00:30:18",  # Supermicro (server boards)
+    "00:25:90",  # Supermicro
+    "00:30:48",  # Supermicro (X9/X10 onboard)
+)
 
 
 def derive_device_id(username):
@@ -319,18 +338,13 @@ def derive_device_id(username):
     # real board serials are alphanumeric and usually contain non-hex letters,
     # so an 8-hex serial reads as a hash. Map hash bytes onto the OEM alphabet.
     serial = "".join(_OEM_SERIAL_ALPHABET[int(h[i*2:i*2+2], 16) % len(_OEM_SERIAL_ALPHABET)] for i in range(8))
-    b = bytes.fromhex(h[16:28])[:6]
-    mac_bytes = bytearray(b)
-    # First byte fixed to 0x02: the canonical locally-administered unicast
-    # prefix (U/L bit=1, I/G bit=0). 0x02:xx:xx:xx:xx:xx is the standard form
-    # for software-assigned MACs (VMs, containers). Keeping hash bits in the
-    # high nibble (e.g. 0x56/0x92) is neither a real OUI nor a standard local
-    # address, and stands out as algorithmically generated.
-    mac_bytes[0] = 0x02
-    # MAC is lowercase colon-separated, matching Node.js os.networkInterfaces()
-    # iface.mac format (the official client stores iface.mac into the `ip` var
-    # and concatenates `${serial}-${ip}`). Uppercase here would mismatch.
-    mac = ":".join(f"{x:02x}" for x in mac_bytes)
+    # MAC: pick a real vendor OUI prefix (stable per-account via hash) + 3
+    # hash-derived trailing bytes. Reads as a physical NIC (U/L=0), unlike the
+    # 02: software-address prefix. Lowercase colon form matches Node.js
+    # iface.mac (the client concatenates ${serial}-${iface.mac}).
+    oui = _VENDOR_OUI_POOL[int(h[16:18], 16) % len(_VENDOR_OUI_POOL)]
+    tail = ":".join(h[i:i + 2] for i in (18, 20, 22))
+    mac = f"{oui}:{tail}"
     return f"{serial}-{mac}"
 
 
