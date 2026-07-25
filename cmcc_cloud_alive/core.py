@@ -285,8 +285,13 @@ def gen_soho_uuid():
     return "uuid_" + "".join(raw)
 
 
-DEVICE_ID_VERSION = 3  # bump to invalidate previously-persisted deviceIds (v3: 0x02 MAC prefix)
+DEVICE_ID_VERSION = 4  # bump to invalidate previously-persisted deviceIds (v4: OEM-style serial)
 _DEVICE_ID_SALT = f"cmcc-alive-deviceid-v{DEVICE_ID_VERSION}"
+# OEM board-serial alphabet: digits + uppercase letters minus confusables (0/O/1/I).
+# Mirrors how real vendors (Lenovo PF0ABCDE, Dell 7-char tag, HP 5CD...) encode
+# serials — alphanumeric and typically containing non-hex letters, so a derived
+# serial doesn't read as a hex hash.
+_OEM_SERIAL_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
 def derive_device_id(username):
@@ -309,9 +314,12 @@ def derive_device_id(username):
     and re-derived (see profile_device_id).
     """
     acct = str(username or "")
-    h = hashlib.sha256(f"{_DEVICE_ID_SALT}:{acct}".encode("utf-8")).hexdigest().upper()
-    serial = h[:8]
-    b = bytes.fromhex(h[8:20])[:6]
+    h = hashlib.sha256(f"{_DEVICE_ID_SALT}:{acct}".encode("utf-8")).hexdigest()
+    # Serial: 8 chars from the OEM alphabet (lenovo/dell/hp-style), NOT hex —
+    # real board serials are alphanumeric and usually contain non-hex letters,
+    # so an 8-hex serial reads as a hash. Map hash bytes onto the OEM alphabet.
+    serial = "".join(_OEM_SERIAL_ALPHABET[int(h[i*2:i*2+2], 16) % len(_OEM_SERIAL_ALPHABET)] for i in range(8))
+    b = bytes.fromhex(h[16:28])[:6]
     mac_bytes = bytearray(b)
     # First byte fixed to 0x02: the canonical locally-administered unicast
     # prefix (U/L bit=1, I/G bit=0). 0x02:xx:xx:xx:xx:xx is the standard form
