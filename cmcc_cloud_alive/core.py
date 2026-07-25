@@ -285,7 +285,7 @@ def gen_soho_uuid():
     return "uuid_" + "".join(raw)
 
 
-DEVICE_ID_VERSION = 2  # bump to invalidate previously-persisted deviceIds
+DEVICE_ID_VERSION = 3  # bump to invalidate previously-persisted deviceIds (v3: 0x02 MAC prefix)
 _DEVICE_ID_SALT = f"cmcc-alive-deviceid-v{DEVICE_ID_VERSION}"
 
 
@@ -313,7 +313,12 @@ def derive_device_id(username):
     serial = h[:8]
     b = bytes.fromhex(h[8:20])[:6]
     mac_bytes = bytearray(b)
-    mac_bytes[0] = (mac_bytes[0] & 0xFE) | 0x02  # locally administered, unicast
+    # First byte fixed to 0x02: the canonical locally-administered unicast
+    # prefix (U/L bit=1, I/G bit=0). 0x02:xx:xx:xx:xx:xx is the standard form
+    # for software-assigned MACs (VMs, containers). Keeping hash bits in the
+    # high nibble (e.g. 0x56/0x92) is neither a real OUI nor a standard local
+    # address, and stands out as algorithmically generated.
+    mac_bytes[0] = 0x02
     mac = ":".join(f"{x:02X}" for x in mac_bytes)
     return f"{serial}-{mac}"
 
